@@ -12,6 +12,10 @@ export type Telemetry = {
   turns: number
   costUsd: number | null
   rateLimit: string
+  // Prompt-cache tokens this session, every loop's turns summed: hits read
+  // from cache; misses written to it or sent uncached.
+  cacheHit: number
+  cacheMiss: number
 }
 
 export type Project = { cwd: string; repo: string | null }

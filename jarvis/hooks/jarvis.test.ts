@@ -106,7 +106,7 @@ test('the diagnostics pane draws the arc reactor and the stats', async $ => {
       viewport: VIEWPORT,
     })
     expect(await ui.find({ text: /Intelligent System/ })).toBeDefined()
-    for (const label of ['Suit Status', 'Neural Core', 'Reactor Load', 'Repulsor Output', 'Iron Legion', 'Missions Flown', 'Voice Protocol', 'Base Location', 'Armory']) {
+    for (const label of ['Suit Status', 'Neural Core', 'Reactor Load', 'Memory Banks', 'Repulsor Output', 'Iron Legion', 'Missions Flown', 'Voice Protocol', 'Base Location', 'Armory']) {
       expect(await ui.find({ text: new RegExp(`^${label}\\s+$`) })).toBeDefined()
     }
     expect(await ui.find({ text: /^Hovering · awaiting orders$/ })).toBeDefined()
@@ -234,4 +234,26 @@ test('the armory names any git repo, not only allowlisted ones', () => {
   expect(repoName({ root: '/u/p/claude-jarvis', remote: 'https://github.com/twok020101/claude-jarvis.git', internal: false, name: null })).toBe('twok020101/claude-jarvis')
   expect(repoName({ root: '/u/p/x', remote: 'git@github.com:me/thing.git', internal: false, name: null })).toBe('me/thing')
   expect(repoName({ root: '/u/p/local-only', remote: null, internal: false, name: null })).toBe('local-only')
+})
+
+test('memory banks tally prompt-cache hits and misses across turns', async ($, on) => {
+  mock.clock(on)
+  on('turn.complete', () => ({ text: '' }))
+  const usage = (read: number, write: number, fresh: number) => ({
+    model: 'claude-opus-5-5', input_tokens: fresh, output_tokens: 100, cache_read_input_tokens: read, cache_creation_input_tokens: write,
+  })
+  await $.turn.complete({ answer: 'a', durationMs: 1000, isAborted: false, turnId: 't1', reason: 'answer', usage: usage(80000, 15000, 5000) })
+  await $.turn.complete({ answer: 'b', durationMs: 1000, isAborted: false, turnId: 't2', agentId: 'sub', reason: 'answer', usage: usage(10000, 0, 0) })
+  const ui = await $.ui.mount({
+    plugin: 'jarvis',
+    surface: 'terminal',
+    component: 'Pane',
+    requestId: 'jarvis-hud',
+    props: { title: 'J.A.R.V.I.S.', isFocused: false, bodyColumns: 90, placement: 'dock', scroll: { offset: 0, bodyRows: 40 }, view: {} },
+    viewport: VIEWPORT,
+  })
+  // 90k read of 110k sent: 82%.
+  expect(await ui.find({ text: /82% LOCKED IN/ })).toBeDefined()
+  expect(await ui.find({ text: /90\.?0?k recalled · 20\.?0?k rebuilt/ })).toBeDefined()
+  await ui.unmount()
 })

@@ -16,7 +16,7 @@ const LONG_MISSION_MS = 60000
 
 const IDLE: Telemetry = {
   isActive: false, tps: 0, outTokens: 0, ctxPercent: 0, ctxTokens: 0, ctxWindow: 0,
-  opus: 0, sonnet: 0, haiku: 0, model: '', turns: 0, costUsd: null, rateLimit: '',
+  opus: 0, sonnet: 0, haiku: 0, model: '', turns: 0, costUsd: null, rateLimit: '', cacheHit: 0, cacheMiss: 0,
 }
 const DEFAULT_PREFS: Prefs = { enabled: true, persona: true, title: 'sir' }
 
@@ -288,6 +288,11 @@ export const register: Register = on => {
   })
 
   on('turn.complete', async ($, e, next) => {
+    const u = e.usage
+    if (u) {
+      const miss = u.cache_creation_input_tokens + u.input_tokens
+      await update($, telemetry, s => ({ ...s, cacheHit: (s.cacheHit ?? 0) + u.cache_read_input_tokens, cacheMiss: (s.cacheMiss ?? 0) + miss }))
+    }
     if (e.agentId) {
       agents.delete(e.agentId)
       await syncLegion($)
@@ -552,6 +557,11 @@ export const register: Register = on => {
     const loadWord = load >= 85 ? 'CRITICAL' : load >= 60 ? 'RUNNING HOT' : 'STABLE'
     const gauge = 12
     const lit = Math.max(0, Math.min(gauge, Math.round((load / 100) * gauge)))
+    const cacheTotal = (t.cacheHit ?? 0) + (t.cacheMiss ?? 0)
+    const recall = cacheTotal ? ((t.cacheHit ?? 0) / cacheTotal) * 100 : 0
+    const recallTone = recall >= 80 ? C.ok : recall >= 50 ? C.gold : C.red
+    const recallWord = recall >= 80 ? 'LOCKED IN' : recall >= 50 ? 'PATCHY' : 'COLD'
+    const recallLit = Math.max(0, Math.min(gauge, Math.round((recall / 100) * gauge)))
     const suits = Math.max(t.opus + t.sonnet + t.haiku, ds.filter(d => d.status === 'run').length)
 
     let reactor: RenderNode = <Text color={C.arc}>◉</Text>
@@ -591,6 +601,18 @@ export const register: Register = on => {
             <Text color={loadTone} bold>{` ${Math.round(load)}% ${loadWord}`}</Text>
             <Text color={C.arcDim}>{t.ctxWindow ? `  ${k(t.ctxTokens)}/${k(t.ctxWindow)} tokens` : ''}</Text>
           </Text>,
+        )}
+        {row(
+          'Memory Banks',
+          cacheTotal ? (
+            <Text>
+              <Text color={recallTone}>{'█'.repeat(recallLit)}</Text>
+              <Text color={C.grid}>{'░'.repeat(gauge - recallLit)}</Text>
+              <Text color={recallTone} bold>{` ${Math.round(recall)}% ${recallWord}`}</Text>
+              <Text color={C.arcDim}>{`  ${k(t.cacheHit)} recalled · ${k(t.cacheMiss)} rebuilt`}</Text>
+            </Text>
+          ) : 'Memory banks cold · no transmissions yet',
+          C.arcDim,
         )}
         {row(
           'Repulsor Output',
