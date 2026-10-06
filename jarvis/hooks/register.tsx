@@ -1,7 +1,7 @@
 import { atom, read, update } from 'claude-code'
-import type { EngineInterface, Register, RenderNode, SessionRepo } from 'claude-code'
+import type { AgentStatus, EngineInterface, Register, RenderNode, SessionRepo } from 'claude-code'
 
-import type { Deploy, Op, OpStatus, Prefs, Project, Telemetry } from '../types'
+import type { CacheGuard, Deploy, Op, OpStatus, Prefs, Project, Telemetry } from '../types'
 import { roundsOf } from './rounds'
 import { C, k } from './theme'
 
@@ -13,12 +13,22 @@ const UPLINK_LINGER_MS = 9000
 const REFRESH_MS = 5000
 const DOCK_COLUMNS = 58
 const LONG_MISSION_MS = 60000
+const GUARD_TICK_MS = 15000
+const TTL_MS = { '5m': 5 * 60000, '1h': 60 * 60000 } as const
+// How long before expiry the guard acts: room for a keep-alive, or a
+// compaction's summary request, to reach the cache while it still holds.
+const GUARD_MARGIN_MS = { '5m': 75000, '1h': 5 * 60000 } as const
+// Below this the conversation is cheap to re-cache; compacting it gains nothing.
+const MIN_COMPACT_TOKENS = 20000
+const LIVE_AGENT: readonly AgentStatus[] = ['pending', 'running', 'waiting']
+const KEEPALIVE_PROMPT = 'Cache keep-alive ping. Reply with the single word: ok'
 
 const IDLE: Telemetry = {
   isActive: false, tps: 0, outTokens: 0, ctxPercent: 0, ctxTokens: 0, ctxWindow: 0,
   opus: 0, sonnet: 0, haiku: 0, model: '', turns: 0, costUsd: null, rateLimit: '', cacheHit: 0, cacheMiss: 0,
 }
-const DEFAULT_PREFS: Prefs = { enabled: true, persona: true, title: 'sir' }
+const DEFAULT_PREFS: Prefs = { enabled: true, persona: true, title: 'sir', cacheGuard: true }
+const COLD: CacheGuard = { ttl: null, warmAt: 0, leftMs: 0, pings: 0, compacted: false, note: '' }
 
 const telemetry = atom({ plugin: 'jarvis', key: 'telemetry' } as const, IDLE)
 const project = atom({ plugin: 'jarvis', key: 'project' } as const, { cwd: '', repo: null })
@@ -30,6 +40,7 @@ const prefs = atom({ plugin: 'jarvis', key: 'prefs' } as const, DEFAULT_PREFS)
 // Session state, so a hot reload neither greets again nor repeats an alert.
 const greeted = atom({ plugin: 'jarvis', key: 'greeted' } as const, false)
 const loadAlert = atom({ plugin: 'jarvis', key: 'loadAlert' } as const, 0)
+const cache = atom({ plugin: 'jarvis', key: 'cache' } as const, COLD)
 
 // "jarvis off", "Jarvis, on", "hey jarvis stand down", "jarvis wake up".
 const SWITCH = /^\s*(?:hey\s+)?jarvis[\s,.:!-]+(on|off|stand\s+down|wake\s+up|online|offline|dashboard|status)\s*[.!]*\s*$/i
@@ -184,6 +195,7 @@ async function backfillCache($: EngineInterface) {
   for (const path of paths) {
     const text = await $.fs.read(path).catch(() => '')
     if (typeof text !== 'string') continue
+    if (path === paths[0]) await noteWarmth($, text)
     for (const line of text.split('\n')) {
       if (!line.includes('cache_read_input_tokens')) continue
       try {
@@ -196,6 +208,116 @@ async function backfillCache($: EngineInterface) {
     }
   }
   if (hit + miss > 0) await update($, telemetry, s => ({ ...s, cacheHit: hit, cacheMiss: miss }))
+}
+
+// The main transcript's last request: the TTL it wrote its cache with and when
+// it was sent. Only moves warmAt forward: a keep-alive is not in the transcript.
+export const warmthOf = (text: string): { ttl: CacheGuard['ttl']; at: number } => {
+  let ttl: CacheGuard['ttl'] = null
+  let at = 0
+  for (const line of text.split('\n')) {
+    if (!line.includes('"cache_creation"')) continue
+    try {
+      const row = JSON.parse(line) as {
+        timestamp?: string
+        message?: { usage?: { cache_creation?: { ephemeral_1h_input_tokens?: number; ephemeral_5m_input_tokens?: number } } }
+      }
+      const c = row.message?.usage?.cache_creation
+      if (!c) continue
+      if ((c.ephemeral_1h_input_tokens ?? 0) > 0) ttl = '1h'
+      else if ((c.ephemeral_5m_input_tokens ?? 0) > 0) ttl = '5m'
+      const t = row.timestamp ? Date.parse(row.timestamp) : NaN
+      if (!Number.isNaN(t)) at = Math.max(at, t)
+    } catch {}
+  }
+  return { ttl, at }
+}
+
+async function noteWarmth($: EngineInterface, text: string) {
+  const w = warmthOf(text)
+  await update($, cache, s => ({
+    ...s,
+    ttl: w.ttl ?? s.ttl,
+    warmAt: s.compacted ? s.warmAt : Math.max(s.warmAt, w.at),
+  }))
+}
+
+// Reads the TTL from the main transcript while it is still unknown.
+async function detectTtl($: EngineInterface) {
+  if ((await read($, cache)).ttl !== null) return
+  const base = (await $.env.get('CLAUDE_CONFIG_DIR')) ?? ((await $.env.get('HOME')) ?? '') + '/.claude'
+  if (base === '/.claude') return
+  const [root, id] = await Promise.all([$.session.root(), $.session.id()])
+  const text = await $.fs.read(`${base}/projects/${root.replace(/[^a-zA-Z0-9]/g, '-')}/${id}.jsonl`).catch(() => '')
+  if (typeof text === 'string' && text) await noteWarmth($, text)
+}
+
+// Re-sends the main transcript's prefix: a cache read resets its TTL.
+async function keepWarm($: EngineInterface, why: string) {
+  const r = await $.model.fork({ prompt: KEEPALIVE_PROMPT })
+  const now = await $.clock.now()
+  if (r.isAnswered || r.reason === 'empty-reply') {
+    await update($, cache, s => ({ ...s, warmAt: now, pings: s.pings + 1, note: `Kept warm · ${why}` }))
+  } else if (r.reason === 'nothing-to-fork') {
+    await update($, cache, s => ({ ...s, warmAt: 0, note: '' }))
+  } else {
+    // Left as it was: the next tick, still inside the margin, tries again.
+    await update($, cache, s => ({ ...s, note: `Keep-alive failed · ${r.reason}` }))
+  }
+}
+
+async function compactBeforeCold($: EngineInterface) {
+  const p = await read($, prefs)
+  await update($, cache, s => ({ ...s, warmAt: 0, compacted: true, note: 'Compacting before the cache lapses' }))
+  await notify($, `◉ Memory banks cooling, ${p.title}. Compacting while the cache still holds.`)
+  try {
+    const r = await $.session.compact()
+    const note = r.skip !== undefined
+      ? `Compaction skipped · ${r.skip}`
+      : `Compacted${r.tokensBefore && r.tokensAfter ? ` ${k(r.tokensBefore)} → ${k(r.tokensAfter)}` : ''} · idle, no suits airborne`
+    await update($, cache, s => ({ ...s, note }))
+    await refresh($)
+  } catch (err) {
+    // A turn began meanwhile; its own request rewarms the cache.
+    await update($, cache, s => ({ ...s, note: `Compaction deferred · ${err instanceof Error ? err.message : String(err)}` }))
+  }
+}
+
+let guarding = false
+
+// Before the main thread's prompt cache lapses: with a subagent in flight (or
+// a turn mid-tool, when compaction cannot run) it is kept warm; idle, the
+// conversation is compacted once while the cache still serves it.
+async function guardCache($: EngineInterface) {
+  if (guarding) return
+  guarding = true
+  try {
+    const p = await read($, prefs)
+    if (!p.enabled || !p.cacheGuard) return
+    const g = await read($, cache)
+    if (g.ttl === null || g.warmAt === 0) return
+    const now = await $.clock.now()
+    const left = g.warmAt + TTL_MS[g.ttl] - now
+    await update($, cache, s => ({ ...s, leftMs: Math.max(0, left) }))
+    if (left > GUARD_MARGIN_MS[g.ttl]) return
+    if (left <= 0) {
+      // Lapsed already (the machine slept): nothing left to save.
+      await update($, cache, s => ({ ...s, warmAt: 0, note: 'Lapsed before the guard could act' }))
+      return
+    }
+    const live = (await $.agent.list().catch(() => [])).filter(a => LIVE_AGENT.includes(a.status)).length
+    const t = await read($, telemetry)
+    if (live > 0) return keepWarm($, `${live} ${live === 1 ? 'suit' : 'suits'} airborne`)
+    if (t.isActive) return keepWarm($, 'directive in progress')
+    const ctx = (await $.session.usage().catch(() => undefined))?.context.tokens ?? t.ctxTokens
+    if (g.compacted || ctx < MIN_COMPACT_TOKENS) {
+      await update($, cache, s => ({ ...s, warmAt: 0, note: 'Left to cool · cheap to rebuild' }))
+      return
+    }
+    await compactBeforeCold($)
+  } finally {
+    guarding = false
+  }
 }
 
 // Subagents seen flying, by agentId; module state, so a reload starts it over.
@@ -239,12 +361,15 @@ export const register: Register = on => {
     await update($, prefs, () => p)
     await $.command.register({
       name: 'jarvis',
-      description: 'J.A.R.V.I.S. workstation · /jarvis on|off · persona on|off · title <word>',
+      description: 'J.A.R.V.I.S. workstation · /jarvis on|off · persona on|off · title <word> · cache on|off',
     })
     await refresh($)
     void backfillCache($).catch(() => undefined)
     $.clock.every(REFRESH_MS, () => {
       void read($, telemetry).then(t => (t.isActive ? undefined : Promise.all([refresh($), syncLegion($)])))
+    })
+    $.clock.every(GUARD_TICK_MS, () => {
+      void guardCache($).catch(() => undefined)
     })
     if (p.enabled && !(await read($, greeted))) {
       await update($, greeted, () => true)
@@ -307,6 +432,10 @@ export const register: Register = on => {
   })
 
   on('turn.step', async function* ($, e, next) {
+    if (!e.agentId) {
+      const now = await $.clock.now()
+      await update($, cache, s => ({ ...s, warmAt: now, compacted: false }))
+    }
     if (e.agentId) {
       const isNew = !agents.has(e.agentId)
       agents.set(e.agentId, { model: e.model, seen: await $.clock.now() })
@@ -343,6 +472,7 @@ export const register: Register = on => {
     await update($, awaiting, () => false)
     await refresh($)
     await alertLoad($)
+    void detectTtl($).catch(() => undefined)
     if (secs * 1000 >= LONG_MISSION_MS) {
       const p = await read($, prefs)
       await notify($, `◆ Mission complete in ${duration(secs * 1000)}, ${p.title}.`)
@@ -546,6 +676,14 @@ export const register: Register = on => {
       await savePrefs($, { persona: arg !== 'off' })
       return { text: `Persona ${arg === 'off' ? 'disengaged' : 'engaged'} (applies from the next request).` }
     }
+    if (cmd === 'cache') {
+      await savePrefs($, { cacheGuard: arg !== 'off' })
+      return {
+        text: arg === 'off'
+          ? 'Cache guard disengaged. The prompt cache will lapse on its own schedule.'
+          : 'Cache guard engaged: kept warm while subagents fly, compacted before it lapses when idle.',
+      }
+    }
     if (cmd === 'title' && arg) {
       await savePrefs($, { title: arg })
       return { text: `Very good. I shall address you as "${arg}".` }
@@ -598,6 +736,14 @@ export const register: Register = on => {
     const recallWord = recall >= 80 ? 'LOCKED IN' : recall >= 50 ? 'PATCHY' : 'COLD'
     const recallLit = Math.max(0, Math.min(gauge, Math.round((recall / 100) * gauge)))
     const suits = Math.max(t.opus + t.sonnet + t.haiku, ds.filter(d => d.status === 'run').length)
+    const g = await read($, cache)
+    const guardLine = !p.cacheGuard
+      ? 'Disengaged · /jarvis cache on'
+      : g.ttl === null
+        ? 'Calibrating · TTL not yet known'
+        : g.warmAt === 0
+          ? `${g.ttl} TTL · ${g.note || 'standing by'}`
+          : `${g.ttl} TTL · cold in ${duration(g.leftMs || TTL_MS[g.ttl])}${g.pings ? ` · ${g.pings} keep-alive${g.pings === 1 ? '' : 's'}` : ''}${g.note ? ` · ${g.note}` : ''}`
 
     let reactor: RenderNode = <Text color={C.arc}>◉</Text>
     if (e.surface === 'terminal' || e.surface === 'desktop') {
@@ -649,6 +795,7 @@ export const register: Register = on => {
           ) : 'Memory banks cold · no transmissions yet',
           C.arcDim,
         )}
+        {row('Cache Guard', guardLine, p.cacheGuard && g.ttl !== null ? C.ok : C.arcDim)}
         {row(
           'Repulsor Output',
           t.outTokens || t.tps

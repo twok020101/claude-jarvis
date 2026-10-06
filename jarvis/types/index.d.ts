@@ -38,7 +38,21 @@ export type Deploy = {
 
 // `enabled` is workstation mode: off, every hook passes and Claude Code
 // looks as it does without the mod.
-export type Prefs = { enabled: boolean; persona: boolean; title: string }
+export type Prefs = { enabled: boolean; persona: boolean; title: string; cacheGuard: boolean }
+
+// The main thread's prompt cache, kept warm or compacted before it lapses.
+export type CacheGuard = {
+  // The TTL the session's requests write, read from the transcript; null until known.
+  ttl: '5m' | '1h' | null
+  // When a main-thread request (or a keep-alive) last read the cache; 0 when none
+  // is being tracked (nothing sent yet, compacted, or left to cool).
+  warmAt: number
+  leftMs: number
+  pings: number
+  // Compacted for this idle stretch; the next main-thread request clears it.
+  compacted: boolean
+  note: string
+}
 
 declare module 'claude-code' {
   interface PluginState {
@@ -52,6 +66,7 @@ declare module 'claude-code' {
       prefs: Prefs
       greeted: boolean
       loadAlert: number
+      cache: CacheGuard
     }
   }
 }

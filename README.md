@@ -20,6 +20,7 @@ Restart Claude Code afterwards.
 - `/jarvis on|off`: toggle the mod
 - `/jarvis persona on|off`: toggle the persona
 - `/jarvis title <word>`: how you're addressed (default `sir`)
+- `/jarvis cache on|off`: the prompt-cache guard (default on). Before the main conversation's cache lapses (75s before a 5m TTL, 5 min before a 1h one), it sends a keep-alive ping while any subagent is running, or, when idle, compacts the conversation once while the cache still holds. The TTL is read from the session transcript, and the guard waits until it knows it. Conversations under 20k tokens are left to cool.
 
 ## Updating
 

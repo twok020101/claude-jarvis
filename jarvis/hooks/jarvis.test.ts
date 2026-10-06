@@ -1,6 +1,7 @@
 import { expect, mock, test } from 'claude-code/testing'
+import type { TestBody } from 'claude-code/testing'
 
-import { repoName } from './register'
+import { repoName, warmthOf } from './register'
 import { roundsOf } from './rounds'
 
 const VIEWPORT = { columns: 140, rows: 40, isFullscreen: true }
@@ -292,4 +293,115 @@ test('memory banks start from what the saved transcript already holds', async ($
   expect(await ui.find({ text: /75% PATCHY/ })).toBeDefined()
   expect(await ui.find({ text: /60\.0k recalled · 20\.0k rebuilt/ })).toBeDefined()
   await ui.unmount()
+})
+
+// ── Cache guard ─────────────────────────────────────────────────────────
+const T0 = Date.parse('2026-10-06T10:00:00Z')
+const MIN = 60000
+const USAGE1 = { input_tokens: 1, output_tokens: 1, cache_read_input_tokens: 90000, cache_creation_input_tokens: 0 }
+
+// Boots the mod over a transcript whose last request wrote a `ttl` cache at T0.
+async function bootGuard(
+  $: Parameters<TestBody>[0],
+  on: Parameters<TestBody>[1],
+  opts: { ttl: '5m' | '1h' | null; agents: () => string[]; ctxTokens?: number },
+) {
+  mock.store(on)
+  mock.env(on, { HOME: '/home/tony' })
+  const clock = mock.clock(on)
+  await clock.set(T0)
+  const creation = opts.ttl === '1h'
+    ? { ephemeral_1h_input_tokens: 4000, ephemeral_5m_input_tokens: 0 }
+    : opts.ttl === '5m' ? { ephemeral_1h_input_tokens: 0, ephemeral_5m_input_tokens: 4000 } : null
+  const line = JSON.stringify({
+    type: 'assistant',
+    timestamp: new Date(T0).toISOString(),
+    message: { id: 'm1', usage: { input_tokens: 1, cache_read_input_tokens: 0, cache_creation_input_tokens: 4000, output_tokens: 1, ...(creation ? { cache_creation: creation } : {}) } },
+  })
+  const calls = { fork: 0, compact: 0 }
+  on('session.root', () => ({ value: '/work/stark.io' }))
+  on('session.id', () => ({ value: 'abc' }))
+  on('session.usage', () => ({
+    value: { startedAt: T0, context: { percent: 45, tokens: opts.ctxTokens ?? 90000, window: 200000 }, rateLimits: [] },
+  }))
+  on('fs.exists', () => ({ value: false }))
+  on('fs.read', () => ({ value: line }))
+  on('command.register', () => ({ value: { command: 'jarvis' } }))
+  on('session.start', ($, e) => ({ cwd: e.cwd }))
+  on('ui.toast', () => ({ value: undefined }))
+  on('ui.open', () => ({ value: { isPlaced: true } }))
+  on('agent.list', () => ({
+    value: opts.agents().map(id => ({ id, description: 'Map the auth flow', type: 'Explore', status: 'running' as const })),
+  }))
+  on('model.fork', () => {
+    calls.fork += 1
+    return { value: { isAnswered: true, text: 'ok', usage: USAGE1 } }
+  })
+  on('session.compact', () => {
+    calls.compact += 1
+    return { messages: [], tokensBefore: 90000, tokensAfter: 8000 }
+  })
+  await $.session.start({ cwd: '/work/stark.io', surface: 'terminal', isInteractive: true })
+  await clock.settle()
+  return { clock, calls }
+}
+
+test('the transcript says which TTL the cache was written with, and when', () => {
+  const row = (ts: string, h: number, m: number) =>
+    JSON.stringify({ timestamp: ts, message: { usage: { cache_creation: { ephemeral_1h_input_tokens: h, ephemeral_5m_input_tokens: m } } } })
+  expect(warmthOf([row('2026-10-06T10:00:00Z', 0, 500), row('2026-10-06T10:02:00Z', 900, 0), '{"type":"user"}'].join('\n')))
+    .toEqual({ ttl: '1h', at: Date.parse('2026-10-06T10:02:00Z') })
+  expect(warmthOf('{"type":"user"}')).toEqual({ ttl: null, at: 0 })
+})
+
+test('with a subagent in flight the cache is kept warm, never compacted', async ($, on) => {
+  const { clock, calls } = await bootGuard($, on, { ttl: '5m', agents: () => ['a1'] })
+  await clock.advance(3 * MIN)
+  expect(calls.fork).toBe(0)
+  await clock.advance(1 * MIN)
+  expect(calls.fork).toBe(1)
+  // Each keep-alive restarts the five minutes, so one lands every 3¾ minutes.
+  await clock.advance(20 * MIN)
+  expect(calls.fork).toBe(6)
+  expect(calls.compact).toBe(0)
+})
+
+test('idle with no subagents, the conversation is compacted once before the cache lapses', async ($, on) => {
+  const { clock, calls } = await bootGuard($, on, { ttl: '1h', agents: () => [] })
+  await clock.advance(50 * MIN)
+  expect(calls.compact).toBe(0)
+  await clock.advance(6 * MIN)
+  expect(calls.compact).toBe(1)
+  await clock.advance(3 * 60 * MIN)
+  expect(calls.compact).toBe(1)
+  expect(calls.fork).toBe(0)
+})
+
+test('a subagent landing hands the cache over to compaction', async ($, on) => {
+  let flying = ['a1']
+  const { clock, calls } = await bootGuard($, on, { ttl: '5m', agents: () => flying })
+  await clock.advance(4 * MIN)
+  expect(calls.fork).toBe(1)
+  flying = []
+  await clock.advance(4 * MIN)
+  expect(calls.compact).toBe(1)
+})
+
+test('a small conversation is left to cool', async ($, on) => {
+  const small = await bootGuard($, on, { ttl: '5m', agents: () => [], ctxTokens: 5000 })
+  await small.clock.advance(30 * MIN)
+  expect(small.calls).toEqual({ fork: 0, compact: 0 })
+})
+
+test('an unknown TTL leaves the cache alone', async ($, on) => {
+  const { clock, calls } = await bootGuard($, on, { ttl: null, agents: () => ['a1'] })
+  await clock.advance(30 * MIN)
+  expect(calls).toEqual({ fork: 0, compact: 0 })
+})
+
+test('/jarvis cache off disengages the guard', async ($, on) => {
+  const { clock, calls } = await bootGuard($, on, { ttl: '5m', agents: () => ['a1'] })
+  await $.command.run({ ...RUN, command: 'jarvis', args: 'cache off' })
+  await clock.advance(30 * MIN)
+  expect(calls).toEqual({ fork: 0, compact: 0 })
 })
