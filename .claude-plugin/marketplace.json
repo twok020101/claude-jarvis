@@ -1,0 +1,2 @@
+{ "name": "twok-mods", "owner": { "name": "twok" },
+  "plugins": [ { "name": "jarvis", "source": "./jarvis", "description": "J.A.R.V.I.S. HUD: arc-reactor spinner, live telemetry band, subagent uplinks, input alerts and a /jarvis diagnostics pane." } ] }

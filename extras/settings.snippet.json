@@ -1,0 +1,4 @@
+{
+  "statusLine": { "type": "command", "command": "bash ~/.claude/statusline-command.sh" },
+  "enabledPlugins": { "jarvis@twok-mods": true }
+}
