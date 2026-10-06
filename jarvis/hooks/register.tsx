@@ -164,6 +164,40 @@ async function standDown($: EngineInterface) {
   $.ui.toast('J.A.R.V.I.S. standing down. Default interface restored.')
 }
 
+// Prompt-cache tokens the session's saved transcripts already hold (the main
+// loop's and its subagents'), each API response counted once by its id. Run at
+// load, it replaces the tally, so a reload or a resume starts from the truth;
+// live turns add on top. Best effort: a transcript over 4 MiB is skipped.
+async function backfillCache($: EngineInterface) {
+  const base = (await $.env.get('CLAUDE_CONFIG_DIR')) ?? ((await $.env.get('HOME')) ?? '') + '/.claude'
+  if (base === '/.claude') return
+  const [root, id] = await Promise.all([$.session.root(), $.session.id()])
+  const dir = `${base}/projects/${root.replace(/[^a-zA-Z0-9]/g, '-')}`
+  const paths = [`${dir}/${id}.jsonl`]
+  const sub = `${dir}/${id}/subagents`
+  if (await $.fs.exists(sub)) {
+    for (const f of await $.fs.list(sub)) if (f.name.endsWith('.jsonl')) paths.push(`${sub}/${f.name}`)
+  }
+  let hit = 0
+  let miss = 0
+  const seen = new Set<string>()
+  for (const path of paths) {
+    const text = await $.fs.read(path).catch(() => '')
+    if (typeof text !== 'string') continue
+    for (const line of text.split('\n')) {
+      if (!line.includes('cache_read_input_tokens')) continue
+      try {
+        const m = (JSON.parse(line) as { message?: { id?: string; usage?: Record<string, number> } }).message
+        if (!m?.id || !m.usage || seen.has(m.id)) continue
+        seen.add(m.id)
+        hit += m.usage.cache_read_input_tokens ?? 0
+        miss += (m.usage.cache_creation_input_tokens ?? 0) + (m.usage.input_tokens ?? 0)
+      } catch {}
+    }
+  }
+  if (hit + miss > 0) await update($, telemetry, s => ({ ...s, cacheHit: hit, cacheMiss: miss }))
+}
+
 // Subagents seen flying, by agentId; module state, so a reload starts it over.
 const agents = new Map<string, { model: string; seen: number }>()
 
@@ -208,6 +242,7 @@ export const register: Register = on => {
       description: 'J.A.R.V.I.S. workstation · /jarvis on|off · persona on|off · title <word>',
     })
     await refresh($)
+    void backfillCache($).catch(() => undefined)
     $.clock.every(REFRESH_MS, () => {
       void read($, telemetry).then(t => (t.isActive ? undefined : Promise.all([refresh($), syncLegion($)])))
     })

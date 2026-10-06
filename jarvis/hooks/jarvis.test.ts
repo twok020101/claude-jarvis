@@ -257,3 +257,39 @@ test('memory banks tally prompt-cache hits and misses across turns', async ($, o
   expect(await ui.find({ text: /90\.?0?k recalled · 20\.?0?k rebuilt/ })).toBeDefined()
   await ui.unmount()
 })
+
+test('memory banks start from what the saved transcript already holds', async ($, on) => {
+  mock.store(on)
+  const clock = mock.clock(on)
+  mock.env(on, { HOME: '/home/tony' })
+  const reply = (id: string, read: number, write: number) =>
+    JSON.stringify({ type: 'assistant', message: { id, usage: { input_tokens: 0, cache_read_input_tokens: read, cache_creation_input_tokens: write, output_tokens: 1 } } })
+  const transcript = [reply('m1', 0, 20000), reply('m2', 60000, 0), reply('m2', 60000, 0), '{"type":"user"}'].join('\n')
+  const asked: string[] = []
+  on('session.root', () => ({ value: '/work/stark.io' }))
+  on('session.id', () => ({ value: 'abc' }))
+  on('fs.exists', () => ({ value: false }))
+  on('fs.read', ($, e) => {
+    asked.push(e.path)
+    return { value: transcript }
+  })
+  on('command.register', () => ({ value: undefined }))
+  on('session.start', ($, e) => ({ cwd: e.cwd }))
+  on('ui.toast', () => ({ value: undefined }))
+  on('ui.open', () => ({ value: { isPlaced: true } }))
+  await $.session.start({ source: 'startup', cwd: '/work/stark.io' })
+  await clock.settle()
+  expect(asked).toEqual(['/home/tony/.claude/projects/-work-stark-io/abc.jsonl'])
+  const ui = await $.ui.mount({
+    plugin: 'jarvis',
+    surface: 'terminal',
+    component: 'Pane',
+    requestId: 'jarvis-hud',
+    props: { title: 'J.A.R.V.I.S.', isFocused: false, bodyColumns: 90, placement: 'dock', scroll: { offset: 0, bodyRows: 40 }, view: {} },
+    viewport: VIEWPORT,
+  })
+  // m2 is one response written twice: 60k of 80k, 75%.
+  expect(await ui.find({ text: /75% PATCHY/ })).toBeDefined()
+  expect(await ui.find({ text: /60\.0k recalled · 20\.0k rebuilt/ })).toBeDefined()
+  await ui.unmount()
+})
