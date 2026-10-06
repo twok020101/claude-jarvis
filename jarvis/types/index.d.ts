@@ -28,6 +28,8 @@ export type Deploy = {
   type: string
   description: string
   status: OpStatus
+  // Set for a background launch: the subagent's own turn.complete settles it.
+  agentId?: string
 }
 
 // `enabled` is workstation mode: off, every hook passes and Claude Code

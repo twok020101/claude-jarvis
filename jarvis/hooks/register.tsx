@@ -1,5 +1,5 @@
 import { atom, read, update } from 'claude-code'
-import type { EngineInterface, Register, RenderNode } from 'claude-code'
+import type { EngineInterface, Register, RenderNode, SessionRepo } from 'claude-code'
 
 import type { Deploy, Op, OpStatus, Prefs, Project, Telemetry } from '../types'
 import { roundsOf } from './rounds'
@@ -73,6 +73,15 @@ const persona = (title: string) =>
     'The persona is flavour only: never let it reduce accuracy, change technical content, pad answers or slow the work. When the work is serious or the user is frustrated, be plain and brief.',
   ].join('\n')
 
+// `repo.name` is set only for the build's own allowlisted repos, so name it
+// from the origin remote (`owner/name`), else the root folder.
+export const repoName = (repo: SessionRepo | null): string | null => {
+  if (!repo) return null
+  if (repo.name) return repo.name
+  const m = repo.remote?.match(/[:/]([^/:]+\/[^/]+?)(?:\.git)?\/?$/)
+  return m?.[1] ?? repo.root.split('/').filter(Boolean).pop() ?? null
+}
+
 // Model, context, cost, rate limit, turns and project, read from the session.
 async function refresh($: EngineInterface) {
   const read5 = await Promise.all([
@@ -92,7 +101,7 @@ async function refresh($: EngineInterface) {
     costUsd: usage.cost?.usd ?? null,
     rateLimit: limit ? `${Math.round(limit.percentUsed)}% of ${limit.kind} limit used` : '',
   }))
-  const next: Project = { cwd, repo: repo?.name ?? null }
+  const next: Project = { cwd, repo: repoName(repo) }
   await update($, project, p => (p.cwd === next.cwd && p.repo === next.repo ? p : next))
 }
 
@@ -155,14 +164,36 @@ async function standDown($: EngineInterface) {
   $.ui.toast('J.A.R.V.I.S. standing down. Default interface restored.')
 }
 
+// Subagents seen flying, by agentId; module state, so a reload starts it over.
+const agents = new Map<string, { model: string; seen: number }>()
+
+// Iron Legion counts by model family. Background subagents outlive the
+// main turn, so this runs from their own events and the idle refresh too.
+async function syncLegion($: EngineInterface) {
+  const now = await $.clock.now()
+  const airborne = new Set((await read($, deploys)).flatMap(d => (d.status === 'run' && d.agentId ? [d.agentId] : [])))
+  for (const [id, a] of agents) if (!airborne.has(id) && now - a.seen > AGENT_TTL_MS) agents.delete(id)
+  const counts = { opus: 0, sonnet: 0, haiku: 0 }
+  for (const a of agents.values()) counts[family(a.model)] += 1
+  await update($, telemetry, s =>
+    s.opus === counts.opus && s.sonnet === counts.sonnet && s.haiku === counts.haiku ? s : { ...s, ...counts })
+}
+
+// A deploy is over: mark it, say so, and clear its uplink after a linger.
+async function land($: EngineInterface, id: string, type: string, status: OpStatus) {
+  await update($, deploys, list => list.map(d => (d.id === id ? { ...d, status } : d)))
+  await notify($, status === 'ok' ? `✓ ${type.toUpperCase()} is back with intel.` : `✗ Lost contact with ${type.toUpperCase()}.`)
+  $.clock.after(UPLINK_LINGER_MS, () => {
+    void update($, deploys, list => list.filter(d => d.id !== id))
+  })
+}
+
 export const register: Register = on => {
   let startedAt = 0
   let chars = 0
   let samples: Array<[number, number]> = []
   let stopTicker: (() => void) | undefined
   let ticks = 0
-  const agents = new Map<string, { model: string; seen: number }>()
-
   // ── Boot ───────────────────────────────────────────────────────────
   on('session.start', async ($, e, next) => {
     const stored = ((await $.store.get(STORE_PREFS)) ?? {}) as Partial<Prefs> & { hud?: boolean }
@@ -178,7 +209,7 @@ export const register: Register = on => {
     })
     await refresh($)
     $.clock.every(REFRESH_MS, () => {
-      void read($, telemetry).then(t => (t.isActive ? undefined : refresh($)))
+      void read($, telemetry).then(t => (t.isActive ? undefined : Promise.all([refresh($), syncLegion($)])))
     })
     if (p.enabled && !(await read($, greeted))) {
       await update($, greeted, () => true)
@@ -222,17 +253,15 @@ export const register: Register = on => {
     const timer = $.clock.every(250, async () => {
       const now = await $.clock.now()
       ticks += 1
-      for (const [id, a] of agents) if (now - a.seen > AGENT_TTL_MS) agents.delete(id)
       samples.push([now, chars / 4])
       samples = samples.filter(([t]) => now - t <= 2000)
       const [t0, c0] = samples[0] ?? [now, 0]
       const span = (now - t0) / 1000
       const tps = span > 0.2 ? (chars / 4 - c0) / span : 0
       const ctx = ticks % 4 === 1 ? (await $.session.usage()).context : undefined
-      const counts = { opus: 0, sonnet: 0, haiku: 0 }
-      for (const a of agents.values()) counts[family(a.model)] += 1
+      await syncLegion($)
       await update($, telemetry, s => ({
-        ...s, ...counts, tps, outTokens: Math.round(chars / 4),
+        ...s, tps, outTokens: Math.round(chars / 4),
         ctxPercent: ctx?.percent ?? s.ctxPercent,
         ctxTokens: ctx?.tokens ?? s.ctxTokens,
         ctxWindow: ctx?.window ?? s.ctxWindow,
@@ -243,7 +272,11 @@ export const register: Register = on => {
   })
 
   on('turn.step', async function* ($, e, next) {
-    if (e.agentId) agents.set(e.agentId, { model: e.model, seen: await $.clock.now() })
+    if (e.agentId) {
+      const isNew = !agents.has(e.agentId)
+      agents.set(e.agentId, { model: e.model, seen: await $.clock.now() })
+      if (isNew) await syncLegion($)
+    }
     const it = next(e)[Symbol.asyncIterator]()
     for (;;) {
       const r = await it.next()
@@ -257,14 +290,16 @@ export const register: Register = on => {
   on('turn.complete', async ($, e, next) => {
     if (e.agentId) {
       agents.delete(e.agentId)
+      await syncLegion($)
+      const d = (await read($, deploys)).find(x => x.agentId === e.agentId && x.status === 'run')
+      if (d) await land($, d.id, d.type, e.reason === 'answer' ? 'ok' : 'err')
       return next(e)
     }
     stopTicker?.()
     stopTicker = undefined
-    agents.clear()
     const secs = Math.max((await $.clock.now()) - startedAt, 1) / 1000
     const out = e.usage?.output_tokens ?? Math.round(chars / 4)
-    await update($, telemetry, s => ({ ...s, isActive: false, outTokens: out, tps: out / secs, opus: 0, sonnet: 0, haiku: 0 }))
+    await update($, telemetry, s => ({ ...s, isActive: false, outTokens: out, tps: out / secs }))
     await update($, awaiting, () => false)
     await refresh($)
     await alertLoad($)
@@ -298,12 +333,15 @@ export const register: Register = on => {
     await update($, ops, list => list.map(o => (o.id === op.id ? { ...o, status } : o)))
     if (isQuestion) await update($, awaiting, () => false)
     if (isAgent) {
-      await update($, deploys, list => list.map(d => (d.id === op.id ? { ...d, status } : d)))
-      const type = (e.subagent_type ?? 'general-purpose').toUpperCase()
-      await notify($, status === 'ok' ? `✓ ${type} is back with intel.` : `✗ Lost contact with ${type}.`)
-      $.clock.after(UPLINK_LINGER_MS, () => {
-        void update($, deploys, list => list.filter(d => d.id !== op.id))
-      })
+      const type = e.subagent_type ?? 'general-purpose'
+      const rec = ran.result as { status?: string; agentId?: string; resolvedModel?: string } | undefined
+      if (status === 'ok' && (rec?.status === 'async_launched' || rec?.status === 'remote_launched') && rec.agentId) {
+        // Launched into the background: still airborne until its own turn.complete.
+        const agentId = rec.agentId
+        await update($, deploys, list => list.map(d => (d.id === op.id ? { ...d, agentId } : d)))
+        if (!agents.has(agentId)) agents.set(agentId, { model: rec.resolvedModel ?? '', seen: await $.clock.now() })
+        await syncLegion($)
+      } else await land($, op.id, type, status)
     }
     const fields = e as { file_path?: unknown; notebook_path?: unknown }
     const path = fields.file_path ?? fields.notebook_path
@@ -402,11 +440,13 @@ export const register: Register = on => {
     const input = (e.props.input ?? {}) as { description?: string; subagent_type?: string }
     if (!input.description || !(await isOn($))) return next(e)
     const { Box, Text } = $.ui.resolve(e)
+    // A background launch's tool use finishes at once; its deploy says whether it still flies.
+    const deploy = (await read($, deploys)).find(d => d.id === e.props.tool_use_id)
     const [state, color] = e.props.isInterrupted
       ? ['⊘ RECALLED', C.gold]
-      : e.props.isErrored
+      : e.props.isErrored || deploy?.status === 'err'
         ? ['✗ MISSION FAILED', C.red]
-        : e.props.isRunning
+        : e.props.isRunning || deploy?.status === 'run'
           ? ['● DEPLOYED · UPLINK OPEN', C.gold]
           : ['✓ MISSION COMPLETE · INTEL RECEIVED', C.ok]
     return (

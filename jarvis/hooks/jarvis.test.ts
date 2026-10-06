@@ -1,5 +1,6 @@
 import { expect, mock, test } from 'claude-code/testing'
 
+import { repoName } from './register'
 import { roundsOf } from './rounds'
 
 const VIEWPORT = { columns: 140, rows: 40, isFullscreen: true }
@@ -198,4 +199,39 @@ test('a subagent launch and return each say so in a notification', async ($, on)
   on('tool.call', { tool: 'Agent' }, async () => ({ result: { text: 'done' } }))
   await $.tool.call({ tool: 'Agent', description: 'Scan the repo', prompt: 'go', subagent_type: 'Explore' })
   expect(toasts).toEqual(['⇢ Deploying EXPLORE: Scan the repo', '✓ EXPLORE is back with intel.'])
+})
+
+test('a background subagent stays airborne until its own turn completes', async ($, on) => {
+  mock.clock(on)
+  on('turn.complete', () => ({ text: '' }))
+  const toasts: string[] = []
+  on('ui.toast', ($, e) => {
+    toasts.push(e.text)
+    return { value: undefined }
+  })
+  on('tool.call', { tool: 'Agent' }, async () => ({
+    result: { status: 'async_launched', agentId: 'a1', description: 'Map the auth flow', prompt: 'go', outputFile: '/tmp/a1' },
+  }))
+  await $.tool.call({ tool: 'Agent', description: 'Map the auth flow', prompt: 'go', subagent_type: 'Explore', run_in_background: true })
+  expect(toasts).toEqual(['⇢ Deploying EXPLORE: Map the auth flow'])
+
+  const band = async (glyph: RegExp) => {
+    const ui = await $.ui.mount({ plugin: 'jarvis', surface: 'terminal', component: 'AbovePrompt', props: BAND, viewport: VIEWPORT })
+    await ui.resize({ columns: 135, rows: 10 })
+    const found = await ui.find({ text: glyph, in: 'hud' })
+    await ui.unmount()
+    return found
+  }
+  expect(await band(/^⇢$/)).toBeDefined()
+
+  await $.turn.complete({ answer: 'found it', durationMs: 4000, isAborted: false, turnId: 't1', agentId: 'a1', reason: 'answer' })
+  expect(toasts).toEqual(['⇢ Deploying EXPLORE: Map the auth flow', '✓ EXPLORE is back with intel.'])
+  expect(await band(/^✓$/)).toBeDefined()
+})
+
+test('the armory names any git repo, not only allowlisted ones', () => {
+  expect(repoName(null)).toBe(null)
+  expect(repoName({ root: '/u/p/claude-jarvis', remote: 'https://github.com/twok020101/claude-jarvis.git', internal: false, name: null })).toBe('twok020101/claude-jarvis')
+  expect(repoName({ root: '/u/p/x', remote: 'git@github.com:me/thing.git', internal: false, name: null })).toBe('me/thing')
+  expect(repoName({ root: '/u/p/local-only', remote: null, internal: false, name: null })).toBe('local-only')
 })

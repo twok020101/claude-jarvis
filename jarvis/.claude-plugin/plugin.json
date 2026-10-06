@@ -1,6 +1,6 @@
 {
   "name": "jarvis",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "J.A.R.V.I.S. HUD: arc-reactor spinner, live telemetry band (context, tok/s, agents by model), subagent uplink animations, input alerts and a /jarvis diagnostics pane.",
   "author": { "name": "twok" },
   "types": "./types/index.d.ts"
